@@ -1,7 +1,7 @@
 
 
 # [DEVICE]
-cd /opt/iotdata/src/iotdata-common/tools/dialout
+cd /opt/iotdata/src/iotdata-depend/dialout
 apt-get install -y --no-install-recommends openssh-client bind9-dnsutils
 cp dialout.client-iotdata.network.cfg dialout.$(hostname).cfg
 ./dialout-client keygen                  # key goes to /var/lib/dialout-client/id_dialout, prints the pubkey line: ssh-ed25519 AAAA... dialout:<hostname>

@@ -75,7 +75,7 @@ chat script re-asserts it anyway, for a swapped module.
 Install
 -------
     apt install ppp
-    cd /opt/iotdata/src/iotdata-common/tools/dialout/simcom-a7670e
+    cd /opt/iotdata/src/iotdata-depend/dialout/simcom-a7670e
     ./install.sh
 
 Test

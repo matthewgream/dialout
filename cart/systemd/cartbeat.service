@@ -6,7 +6,7 @@
 
 [Unit]
 Description=cartbeat (liveness for the node that owns our power rail)
-Documentation=file:/opt/iotdata/src/iotdata-common/tools/dialout/cart/README.md
+Documentation=file:/opt/iotdata/src/iotdata-depend/dialout/cart/README.md
 DefaultDependencies=no
 After=sysinit.target
 Before=basic.target

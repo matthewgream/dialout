@@ -11,7 +11,7 @@
 
 [Unit]
 Description=cartdial (use the window, then give the rail back)
-Documentation=file:/opt/iotdata/src/iotdata-common/tools/dialout/cart/README.md
+Documentation=file:/opt/iotdata/src/iotdata-depend/dialout/cart/README.md
 After=basic.target cartbeat.service
 Wants=cartbeat.service
 # Every way out of this ends with the rail released. cartdial halts on its own paths; this catches

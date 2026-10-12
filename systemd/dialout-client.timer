@@ -2,7 +2,7 @@
 
 [Unit]
 Description=dialout client, every @INTERVAL@
-Documentation=file:/opt/iotdata/src/iotdata-common/tools/dialout/README.md
+Documentation=file:/opt/iotdata/src/iotdata-depend/dialout/README.md
 
 [Timer]
 # Once shortly after boot -- a box that has just been power-cycled is exactly the box someone is

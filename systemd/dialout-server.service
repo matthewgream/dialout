@@ -6,7 +6,7 @@
 
 [Unit]
 Description=dialout server (reverse-tunnel rendezvous: dropbear + DNS + UPnP)
-Documentation=file:/opt/iotdata/src/iotdata-common/tools/dialout/README.md
+Documentation=file:/opt/iotdata/src/iotdata-depend/dialout/README.md
 After=network-online.target
 Wants=network-online.target
 
