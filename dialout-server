@@ -409,8 +409,26 @@ function hostKeyFingerprint() {
 // -j disables LOCAL forwarding, so a client key cannot be used to reach into this server's LAN.
 // Remote forwarding stays on -- that is the entire feature. No -a, so forwarded ports bind to
 // loopback only and you have to be on this box (or through its own sshd) to use them.
+//
+// -K IS LOAD-BEARING, AND ITS ABSENCE COST US WINDOWS. A client that loses power -- which for a cart
+// is the normal way a window ends, and for a remote site is the normal way anything ends -- never
+// sends a FIN. Without keepalives nothing on this side ever probes the peer, so the session child
+// lives for ever: it keeps the forwarded port BOUND and keeps `clients` reporting the tunnel UP days
+// after the box went dark. Seen on iotgate 2026-10-12, 50 minutes into a tunnel whose cart was off.
+//
+// The display is the lesser half. The client dials with ExitOnForwardFailure=yes, so that box's NEXT
+// window cannot bind its port, the dial fails, and a cart burns its retries and halts -- windows
+// quietly eaten until somebody kills the zombie by hand. Dropbear disconnects after three unanswered
+// keepalives, so 30s detects a dead client in about 90.
+//
+// NOT -I (idle timeout): a tunnel that is held open and quiet is the normal state, and how long to
+// hold it is the CLIENT's decision -- it is the only end that knows whether anyone is using it. This
+// side keeps safety limits only, and a half-open socket is a safety problem where an idle one is not.
 function dropbearArgs() {
-    return ['-F', '-E', '-s', '-g', '-w', '-j', '-p', `${cfg('bind', '0.0.0.0')}:${cfgN('port-internal', 47022)}`, '-r', hostKey()];
+    const args = ['-F', '-E', '-s', '-g', '-w', '-j', '-p', `${cfg('bind', '0.0.0.0')}:${cfgN('port-internal', 47022)}`, '-r', hostKey()];
+    const keep = cfgN('sshd-keepalive', 30);
+    if (keep > 0) args.push('-K', String(keep));
+    return args;
 }
 
 function spawnDropbear() {
