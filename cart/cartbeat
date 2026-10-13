@@ -4,7 +4,7 @@
 #
 # The node on the other end of that wire owns our 5V rail. It counts CHANGES on the pin, not the
 # level: a level says something set a pin, an edge rate says software is still running, and it is the
-# wedged board you are switching power for. See iotdata-common/include/device/d_interface_cart.h.
+# wedged board you are switching power for. See iotdata-platform/include/device/d_interface_cart.h.
 #
 # Therefore, and this is the whole discipline of this script:
 #

@@ -1,7 +1,7 @@
 # cart — the Pi side of a switched-rail window
 
 The node (an ESP32 relay) owns the 5V rail and the schedule; see
-`iotdata-common/include/device/d_interface_cart.h` for that side, the switch circuit and the
+`iotdata-platform/include/device/d_interface_cart.h` for that side, the switch circuit and the
 numbers quoted below. This directory is the **cart**: what a Pi Zero has to do between being given
 power and giving it back.
 
