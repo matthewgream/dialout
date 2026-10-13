@@ -10,6 +10,10 @@
 # registering fails a dial attempted twenty seconds after power-on, and that is a window thrown away
 # for something that would have worked at forty-five. Note that `dial` exits 0 when there is no
 # invitation and when there is no SRV record -- those are not failures and are not retried.
+#
+# A carrier that dies mid-window is `dial`'s own problem and it redials inside the window, keeping
+# the link up; it only comes back here non-zero when it could not get the tunnel back at all, and
+# then the window is usually still open and worth another try.
 
 set -eu
 

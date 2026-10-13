@@ -7,14 +7,21 @@
 # ssh -N and opens no session at all, so this does not run on that path; the server stamps those
 # itself when it notices the tunnel appear.
 #
-# It replaces the older command="/bin/false", and is just as inert from the client's point of view:
-# the name comes from the authorized_keys line, so the client cannot choose it, and whatever the
-# client asked to run arrives in SSH_ORIGINAL_COMMAND and is deliberately ignored.
+# It replaces the older command="/bin/false", and is nearly as inert: the name comes from the
+# authorized_keys line, so the client cannot choose it, and of what the client asked to run -- which
+# arrives in SSH_ORIGINAL_COMMAND -- exactly one word means anything here.
+#
+# That word is "drop": please let go of the forwarded port this name owns. A client sends it when
+# its own redial is refused the port because the carrier it just lost is still held on this side.
+# Honouring it is NOT this script's job -- it runs as an unprivileged account and cannot kill a
+# dropbear child -- so it leaves a file for the server's run loop, which is root and knows which pid
+# holds which port, to act on within a few seconds. The name is still ours, so a stolen key can only
+# ever drop its own tunnel, which it could do anyway by hanging up.
 #
 # It exits 0 whatever happens. A server that cannot write its own stamp is a monitoring problem, not
 # a reason to fail a client that did everything right.
 #
-#   dialout-seen <seen-dir> <name>
+#   dialout-seen <seen-dir> <name>          (SSH_ORIGINAL_COMMAND: ignored, or "drop")
 
 set -eu
 
@@ -30,4 +37,15 @@ _tmp="$_dir/.$_name.$$"
 if printf '%s %s %s\n' "$(date -u +%s)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${_ip:--}" >"$_tmp" 2>/dev/null; then
     mv "$_tmp" "$_dir/$_name" 2>/dev/null || rm -f "$_tmp" 2>/dev/null || true
 fi
+
+# The one request that is honoured. The drop dir is derived from the seen dir rather than passed,
+# so every key enrolled before this existed asks for it correctly without rewriting authorized_keys.
+case ${SSH_ORIGINAL_COMMAND:-} in
+drop)
+    _drops=$(dirname "$_dir")/drop
+    mkdir -p "$_drops" 2>/dev/null || true
+    : >"$_drops/$_name" 2>/dev/null || true
+    ;;
+esac
+
 exit 0

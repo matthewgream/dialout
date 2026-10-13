@@ -55,18 +55,29 @@ sessions() {
     echo "$_n"
 }
 
+# Asked more than once, so it says nothing itself -- the caller knows what it is about to decide.
 inhibited() {
     for f in /etc/cart/inhibit /run/cart-inhibit; do
         if [ -e "$f" ]; then
             STAY_REASON="inhibited by $f"
-            log "$STAY_REASON -- running the payloads but staying up"
             return 0
         fi
     done
     return 1
 }
 
+# EVERY halt asks about the inhibit file again, not just the one decided on the way in. The moment
+# you want a board held is usually after its window has started -- you are reading the journal and
+# you want it to stay -- and a file dropped then used to be ignored by a halt decided twenty minutes
+# later, which is how a bench board went dark under an operator on 2026-10-13. Masking
+# cart-halt.service is not the way round that either: the unit lives in /etc/systemd/system, where
+# `systemctl mask` refuses to overwrite it, so the mask silently does not take.
+#
+# The node's backstop still applies. An inhibited cart on a real rail is held by cartbeat, so it is
+# held only until the node gives up on it (CART_BACKSTOP, 2h) and cuts the rail with the filesystem
+# mounted. The inhibit file is a bench tool; it is not a way to live on a node's rail indefinitely.
 halt_now() {
+    if [ "$HALT" = 1 ] && inhibited; then HALT=0; fi
     if [ "$HALT" = 0 ]; then
         log "staying up ($STAY_REASON). Stop beating or halt by hand when you are done."
         exit 0
@@ -98,7 +109,11 @@ else
     log "no payload directory at $WINDOW_D -- nothing to do in this window"
 fi
 
-inhibited && { HALT=0; halt_now; }
+if inhibited; then
+    log "$STAY_REASON -- the payloads are done and this board stays up"
+    HALT=0
+    halt_now
+fi
 
 # ---- hold the rail while somebody is using it --------------------------------------------------
 if [ "$LINGER" = 1 ]; then
@@ -107,6 +122,11 @@ if [ "$LINGER" = 1 ]; then
         log "$_n session(s) logged in -- holding the rail (up to ${LINGER_MAX}s)"
         _waited=0
         while [ "$_n" -gt 0 ]; do
+            if inhibited; then
+                log "$STAY_REASON -- holding the rail, and no longer counting"
+                HALT=0
+                break
+            fi
             [ "$_waited" -ge "$LINGER_MAX" ] && { log "linger cap reached with $_n session(s) still up -- halting anyway"; break; }
             [ "$(elapsed)" -ge "$DEADLINE" ] && { log "window deadline reached -- halting"; break; }
             sleep "$POLL"

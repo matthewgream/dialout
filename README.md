@@ -44,13 +44,13 @@ is nothing to register, distribute, or keep in sync.
 In a screen session on the server:
 
 ```
-$ dialout-server wait --for iotdata-tst-2
-14:22:01Z invited iotdata-tst-2 (920092) -- TXT updated
-14:22:01Z waiting for iotdata-tst-2 (token 920092) on port 47102 -- Ctrl-C to stop and withdraw
+$ dialout-server wait --for iotdata-rem-b827eb2878c0
+14:22:01Z invited iotdata-rem-b827eb2878c0 (6827cc) -- TXT updated
+14:22:01Z waiting for iotdata-rem-b827eb2878c0 (token 6827cc) on port 47432 -- Ctrl-C to stop and withdraw
 ...
-14:41:36Z *** iotdata-tst-2 IS UP ***
+14:41:36Z *** iotdata-rem-b827eb2878c0 IS UP ***
 
-    ssh -p 47102 <user>@127.0.0.1        # from this host
+    ssh -p 47432 <user>@127.0.0.1        # from this host
 ```
 
 It rings the terminal bell when the tunnel appears. **Leave it running while you work**: Ctrl-C
@@ -59,6 +59,23 @@ screen session *is* the invite, so there is nothing to remember to turn off — 
 dismiss it the moment the bell goes and then wonder where your tunnel went. `wait --keep` stops
 watching without withdrawing, if you would rather manage the invitation yourself
 (`dialout-server uninvite <name>`).
+
+Then, from a second window on the server:
+
+```
+$ dialout-server connect "shelter anders" --screen
+09:41:02Z connect: 'shelter anders' -> iotdata-rem-b827eb2878c0 (shelter-anders/relay/raspi/mobile)
+09:41:02Z waiting up to 300s for iotdata-rem-b827eb2878c0 on port 47432 (Ctrl-C to stop)
+09:41:18Z iotdata-rem-b827eb2878c0 is up
+```
+
+`connect` is the `ssh -p <port> root@127.0.0.1` line with the waiting done for you: it sits on the
+port until the tunnel appears, and **reconnects when a flaky link takes the carrier away** instead
+of leaving you to notice "connection refused" and work out why. The client's host key is remembered
+under its name rather than under `127.0.0.1:<port>`, so one entry follows a box around, in a file of
+its own rather than in root's `known_hosts`. `--screen` reattaches a `screen` session on the far end
+(`screen -RR`), which is the difference between a dropped link costing you a terminal and costing
+you the work in it. `--no-retry` and `--wait N` are there when you want one attempt and no waiting.
 
 ## Hanging up
 
@@ -78,6 +95,42 @@ between logins. "Used" means the tunnel is carrying an established connection, s
 
 **`hold-max`.** The absolute cap, busy or not. Keep it well under the timer interval so two runs
 can never fight over the same port.
+
+### A dead carrier is not one of them
+
+The fourth way a tunnel can stop is the one nobody decided: the carrier dies. A mobile link stalls
+past the keepalive budget, the server restarts, a port has not been released yet. That used to end
+the window — the dial returned, the modem went down, and a timer box was gone for another six hours
+over one bad minute. Now the carrier is redialed inside the *same* window: the same `hold-max`, the
+same `idle` clock, the same invitation, up to `redial` times at `redial-wait` apart, with the link
+left up throughout. Measured on a 4G box: carrier killed, tunnel back 66 seconds later with nobody
+watching.
+
+Two things make that work rather than thrash:
+
+**The keepalive budgets are deliberately generous** (`ssh-keepalive` x `ssh-keepalive-max` on the
+client, `sshd-keepalive` on the server — about three minutes each). A link that pauses for a minute
+is one plain TCP rides out, and probing it to death turns a recoverable stall into a dropped
+session. Whichever end is tighter is the end that does the killing, so keep the client's budget at
+or above the server's.
+
+**A held port can be asked for rather than waited out.** A client whose carrier is gone still holds
+its forwarded port on the server until the keepalive budget notices, and `ExitOnForwardFailure`
+means the redial cannot bind in the meantime. So the client asks: one short session with its own
+key, carrying the word `drop`, which the server's run loop acts on within a few seconds by killing
+whatever holds that client's port. The name comes from the server's own register, so a client can
+only ever drop its own tunnel. By hand, for a box you know is gone:
+`dialout-server drop "shelter anders"`.
+
+### One dial at a time
+
+Two dials on one box cannot both have the tunnel, and the damage is not the lost race: the loser's
+cleanup runs `link-script down` and hangs the modem up *underneath* the winner's live session. That
+is how a cart lost a maintenance session twice in half an hour on 2026-10-13, when its boot-delayed
+timer fired into a window the node had already opened. A second dial now refuses the moment it
+starts, before the link hook or DNS or anything else with a side effect, and exits 0 — "somebody
+else already has the tunnel" is a fine outcome for a timer round, not a failure to retry. The lock
+is `flock` on a file in the client state dir, so it is released however the process dies.
 
 ## Boxes whose network *is* the dial-out
 
@@ -153,7 +206,7 @@ a Pi Zero 1, which makes `install` look like it has hung.
 Then hand that public key to the server once:
 
 ```sh
-dialout-server enrol iotdata-tst-2 /path/to/its.pub     # or pipe it on stdin
+dialout-server enrol iotdata-rem-b827eb2878c0 /path/to/its.pub     # or pipe it on stdin
 ```
 
 ### Commissioning a modem box, start to finish

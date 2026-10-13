@@ -133,12 +133,20 @@ not actually a cart means it runs its payloads and powers itself off, and only s
 next to it can undo that. It also checks the things that bite: `pinctrl` present, GPIO17 not in an
 alt mode, neither claiming overlay enabled, and the dialout settings below.
 
-**The bench escape hatch**, honoured before any halt:
+**The bench escape hatch**, honoured before *every* halt -- including one already being counted
+down to, and including the `cart-halt` backstop, so it can be dropped at any point in a window and
+`systemctl stop cartdial` will not take the board away:
 
 ```sh
 touch /etc/cart/inhibit        # this board stays up, across reboots
 touch /run/cart-inhibit        # this boot only
 ```
+
+Do not reach for `systemctl mask cart-halt.service` instead: these units are installed into
+`/etc/systemd/system`, and `systemctl mask` refuses to overwrite a unit file that is already there,
+so the mask fails and the board halts anyway. The node's backstop is still above all of this -- an
+inhibited cart on a real rail is held by `cartbeat` only until the node gives up and cuts the rail,
+so the inhibit is a bench tool and not a way to live on a node's rail.
 
 Settings live in `/etc/cart/cart.conf` (written commented; the defaults are in the scripts):
 `CART_BEAT_PIN`, `CART_BEAT_INTERVAL`, `CART_LINGER_MAX`, `CART_DEADLINE`, `CART_DIAL_TRIES`,

@@ -22,7 +22,7 @@
 //
 // The usual session is one command:
 //
-//   dialout-server wait --for iotdata-tst-2
+//   dialout-server wait --for iotdata-rem-b827eb2878c0
 //
 // which invites that client, waits for its tunnel to appear, rings the terminal bell, tells you
 // the ssh line to paste, and withdraws the invitation when you Ctrl-C out.
@@ -44,11 +44,26 @@
 // register with its tags, invites, liveness stamps) and the config, and `restore` puts it back on
 // another box. The host key is the point -- clients pin it, so both ends must present the same one.
 //
+// A forwarded port lives exactly as long as the carrier that bound it, which on a mobile link is
+// not as long as you would like:
+//
+//   dialout-server connect "solar shed"         # waits for the port, and waits again if it drops
+//   dialout-server connect "solar shed" --screen
+//   dialout-server drop "solar shed"            # let go of a port whose client is gone
+//
+// `connect` is `ssh -p <port> root@127.0.0.1` with the waiting done for you -- it sits on the port
+// until the tunnel appears, reconnects when a flaky link takes it away, and keys the client's host
+// key by name so one entry follows a box between ports. With --screen the far end reattaches a
+// screen session, which is the difference between losing a terminal and losing the work in it.
+// `drop` is the other half: a carrier whose client is already gone still holds the port, and until
+// the keepalive budget notices, that client's next dial cannot bind it. Clients ask for this
+// themselves when their redial is refused the port.
+//
 // Node with no dependencies: it shells out to curl, upnpc, dropbear, ss and dig, the same way
 // iotdata's own lib/iotdata-network.js does. Nothing here imports iotdata -- dialout stands alone,
 // and only reads iotdata.conf as a convenience if you point it at one.
 
-const { execFileSync, spawn } = require('child_process');
+const { execFileSync, spawn, spawnSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
 const os = require('os');
@@ -153,6 +168,9 @@ const authKeys = () => path.join(homeDir(), '.ssh', 'authorized_keys');
 // One file per client, last-write-wins, no locking: a stamp is worth exactly its timestamp, and two
 // pings racing means the box is alive twice over.
 const seenDir = () => path.join(stateDir(), 'seen');
+// where a client's `drop` request lands; dialout-seen derives it from the seen dir it is given, so
+// the forced command in authorized_keys does not have to change to carry it
+const dropDir = () => path.join(stateDir(), 'drop');
 const seenPath = (name) => path.join(seenDir(), name);
 const seenCmd = (dst) => `${path.join(dst, 'dialout-seen')} ${seenDir()}`;
 
@@ -272,6 +290,84 @@ function listening() {
         return ports;
     } catch {
         return new Set();
+    }
+}
+
+// Who holds a forwarded port, and letting go of it on request.
+//
+// A forwarded port is bound by the dropbear SESSION CHILD carrying it, so dropping a tunnel means
+// killing that child, and finding it is a matter of asking ss which pid owns the listening socket.
+// Only a process called dropbear is ever killed, and only on a port derived from an enrolled
+// client's name, so this cannot be talked into shooting anything else on the box.
+//
+// It exists because a dead client's carrier outlives it. Nothing on this side can tell "gone" from
+// "quiet" except the keepalive budget, and while that runs, the client's next dial cannot bind its
+// port (ExitOnForwardFailure) -- which for a cart is a window eaten. The budget is deliberately
+// generous now that a dropped carrier is recoverable (see sshd-keepalive), so rather than tighten
+// it, the client asks for its port back: one short session with its own key, which dialout-seen
+// turns into a file in the drop dir for the run loop to act on. The name comes from authorized_keys,
+// so a client can only ever drop its own tunnel.
+// resolveName lets an unknown name through, because inviting a box before enrolling it is
+// legitimate. Reaching into one, or killing the port derived from one, is not -- that is a typo.
+function enrolledName(arg, verb) {
+    const name = resolveName(arg, verb);
+    if (!clients().some((c) => c.name === name)) die(`${verb}: no client called '${arg}' is enrolled -- see '${SELF} clients'`);
+    return name;
+}
+
+function portHolders(port) {
+    let out = '';
+    try {
+        out = run('ss', ['-ltnpH']);
+    } catch {
+        return [];
+    }
+    const pids = [];
+    const re = new RegExp(`127\\.0\\.0\\.1:${port}\\s`);
+    for (const l of out.split('\n')) {
+        if (!re.test(l)) continue;
+        for (const m of l.matchAll(/\(\("([^"]+)",pid=(\d+)/g)) if (m[1] === 'dropbear') pids.push(+m[2]);
+    }
+    return pids;
+}
+
+function dropTunnel(name) {
+    const port = portOf(name);
+    const pids = portHolders(port);
+    for (const pid of pids) {
+        try {
+            process.kill(pid, 'SIGTERM');
+            log(`drop: ${name} -- killed the carrier holding port ${port} (pid ${pid})`);
+        } catch (e) {
+            warn(`drop: ${name} -- could not kill pid ${pid}: ${e.message}`);
+        }
+    }
+    return pids.length;
+}
+
+// The requests dialout-seen leaves for us. Unlinked before being acted on: a request that cannot be
+// served must not come round again every five seconds.
+function serviceDrops() {
+    let names = [];
+    try {
+        names = fs.readdirSync(dropDir());
+    } catch {
+        return;
+    }
+    for (const n of names) {
+        if (n.startsWith('.')) continue;
+        try {
+            fs.unlinkSync(path.join(dropDir(), n));
+        } catch {
+            continue; // gone already
+        }
+        const c = clients().find((x) => x.name === n);
+        if (!c) {
+            warn(`drop request for '${n}', which is not enrolled -- ignored`);
+            continue;
+        }
+        log(`drop request from ${c.name}${c.tag ? ` (${c.tag})` : ''}`);
+        if (!dropTunnel(c.name)) log(`drop: ${c.name} holds no port -- nothing to do`);
     }
 }
 
@@ -419,14 +515,19 @@ function hostKeyFingerprint() {
 // The display is the lesser half. The client dials with ExitOnForwardFailure=yes, so that box's NEXT
 // window cannot bind its port, the dial fails, and a cart burns its retries and halts -- windows
 // quietly eaten until somebody kills the zombie by hand. Dropbear disconnects after three unanswered
-// keepalives, so 30s detects a dead client in about 90.
+// keepalives, so the default 60s detects a dead client in about three minutes.
+//
+// It was 30 (~66s measured), and that was too tight: it also reaped clients that were merely having
+// a bad minute on a mobile link, taking an operator's session down with them. What makes the looser
+// budget affordable is that a stale port is no longer a lost window -- the client redials inside the
+// same window, and asks for its port back (see dropTunnel) rather than waiting this out.
 //
 // NOT -I (idle timeout): a tunnel that is held open and quiet is the normal state, and how long to
 // hold it is the CLIENT's decision -- it is the only end that knows whether anyone is using it. This
 // side keeps safety limits only, and a half-open socket is a safety problem where an idle one is not.
 function dropbearArgs() {
     const args = ['-F', '-E', '-s', '-g', '-w', '-j', '-p', `${cfg('bind', '0.0.0.0')}:${cfgN('port-internal', 47022)}`, '-r', hostKey()];
-    const keep = cfgN('sshd-keepalive', 30);
+    const keep = cfgN('sshd-keepalive', 60);
     if (keep > 0) args.push('-K', String(keep));
     return args;
 }
@@ -600,6 +701,95 @@ function actionWait(argv) {
     setInterval(tick, 5000);
 }
 
+// Sit on a client's port until the tunnel is there, then ssh through it -- and do it again if a
+// flaky link takes the carrier away mid-session. The host key is keyed by client NAME (HostKeyAlias)
+// rather than by 127.0.0.1:<port>, so an entry follows a box even if its port is ever repinned, and
+// client host keys live in their own file rather than polluting root's known_hosts with loopback.
+function waitForPort(port, secs, name) {
+    if (listening().has(port)) return true;
+    if (secs <= 0) {
+        warn(`connect: ${name} has no tunnel up on port ${port}`);
+        return false;
+    }
+    log(`waiting up to ${secs}s for ${name} on port ${port} (Ctrl-C to stop)`);
+    const until = Date.now() + secs * 1000;
+    while (Date.now() < until) {
+        try {
+            run('sleep', ['2']);
+        } catch {
+            /* interrupted */
+        }
+        if (listening().has(port)) {
+            log(`${name} is up`);
+            return true;
+        }
+    }
+    warn(`connect: ${name} did not come up within ${secs}s`);
+    return false;
+}
+
+function actionConnect(args) {
+    let name = '';
+    let wait = cfgN('connect-wait', 300);
+    let retry = true;
+    let useScreen = false;
+    let user = cfg('connect-user', 'root');
+    let key = cfg('connect-key', '');
+    const remote = [];
+    while (args.length) {
+        const a = args.shift();
+        if (a === '--wait') wait = parseInt(args.shift(), 10) || 0;
+        else if (a === '--no-retry') retry = false;
+        else if (a === '--screen') useScreen = true;
+        else if (a === '--user') user = args.shift();
+        else if (a === '--key') key = args.shift();
+        else if (a === '--') remote.push(...args.splice(0));
+        else if (a.startsWith('-')) die(`connect: unknown option ${a}`);
+        else if (!name) name = a;
+        else remote.push(a);
+    }
+    if (!name) die('connect: need a client (a name, tag or fragment of either)');
+    name = enrolledName(name, 'connect');
+    const port = portOf(name);
+    const ssh = [
+        '-p',
+        String(port),
+        '-o',
+        `HostKeyAlias=dialout-${name}`,
+        '-o',
+        `UserKnownHostsFile=${path.join(stateDir(), 'known_hosts.clients')}`,
+        '-o',
+        'StrictHostKeyChecking=accept-new',
+        '-o',
+        `ServerAliveInterval=${cfgN('connect-keepalive', 30)}`,
+        '-o',
+        `ServerAliveCountMax=${cfgN('connect-keepalive-max', 6)}`,
+    ];
+    if (key) ssh.push('-o', 'IdentitiesOnly=yes', '-i', key);
+    // screen -RR: reattach whatever is there, or start one. The point of a session that outlives the
+    // carrier is that a dropped link costs you the terminal and not the work in it.
+    if (useScreen) {
+        ssh.push('-t');
+        remote.push('screen', '-RR');
+    }
+    for (;;) {
+        if (!waitForPort(port, wait, name)) process.exit(1);
+        const r = spawnSync('ssh', [...ssh, `${user}@127.0.0.1`, ...remote], { stdio: 'inherit' });
+        if (r.error) die(`connect: ${r.error.message}`);
+        if (r.signal) process.exit(1); // Ctrl-C through to ssh: stopping is what was meant
+        // 255 is ssh's own "the connection broke", as opposed to any status the far end returned
+        if (r.status !== 255 || !retry) process.exit(r.status === null ? 0 : r.status);
+        log('connection lost -- waiting for the tunnel to come back (Ctrl-C to stop)');
+    }
+}
+
+function actionDrop(args) {
+    let name = args.shift();
+    if (!name) die('drop: need a client (a name, tag or fragment of either)');
+    name = enrolledName(name, 'drop');
+    if (!dropTunnel(name)) log(`drop: ${name} holds no port (${portOf(name)}) -- nothing to do`);
+}
+
 function actionStatus() {
     const up = listening();
     console.log(`config        ${CFG_FILE || `(none -- built-in defaults; copy dialout.cfg to ${hostCfg()})`}`);
@@ -642,6 +832,10 @@ function chownState() {
         fs.mkdirSync(seenDir(), { recursive: true, mode: 0o700 });
         run('chown', ['-R', `${user}:${user}`, seenDir()]);
         run('chmod', ['700', seenDir()]);
+        // the drop request a client leaves is written by that same account
+        fs.mkdirSync(dropDir(), { recursive: true, mode: 0o700 });
+        run('chown', ['-R', `${user}:${user}`, dropDir()]);
+        run('chmod', ['700', dropDir()]);
     } catch {
         /* not installed yet, or not root -- enrol still works, install fixes ownership */
     }
@@ -972,6 +1166,11 @@ function actionRun(argv) {
     }
 
     ensureHostKey();
+    // Every start, not just install: the state dir gains things over time -- the seen dir, now the
+    // drop dir -- and a server installed before one of them existed would never grow it. The client
+    // writes the drop request as the unprivileged ssh account, so a missing dir means the request
+    // vanishes silently. Idempotent, and it does nothing at all if this is not root.
+    chownState();
     if (!fs.existsSync(authKeys())) warn(`no ${authKeys()} -- no client can log in until one is enrolled`);
 
     let child = null,
@@ -1032,6 +1231,7 @@ function actionRun(argv) {
     // report tunnels coming and going, so a terminal running this is also a fleet monitor
     let seen = new Set();
     setInterval(() => {
+        serviceDrops();
         const up = listening();
         for (const c of clients()) {
             const label = c.tag ? `${c.name} (${c.tag})` : c.name;
@@ -1077,6 +1277,8 @@ const actions = {
     enroll: actionEnrol,
     revoke: actionRevoke,
     clients: actionClients,
+    connect: actionConnect,
+    drop: actionDrop,
     tag: actionTag,
     status: actionStatus,
     install: actionInstall,

@@ -13,8 +13,14 @@
 #      so `dialout-server clients` can tell a quiet box from a dead one. See ping-every.
 #   2. read the endpoint (DNS SRV) -> host and port. No record -> stop.
 #   3. ssh -N -R <our port>:localhost:22 to it.
-#   4. hold, until the invite is withdrawn, or nothing has used it for `idle`, or hold-max.
+#   4. hold, until the invite is withdrawn, or nothing has used it for `idle`, or hold-max. A
+#      carrier that dies before any of those -- a stalled modem, a restarted server, a port the far
+#      end has not released -- is redialed inside the same window and the same clocks (see redial).
 #   5. link-script down, on every path out including the early ones.
+#
+# ONE DIAL AT A TIME. A second dial on the same box refuses and exits 0 rather than racing for the
+# port: the loser of that race tears the link down on its way out, and on a modem box that hangs
+# the link up underneath the winner's live session.
 #
 # An INVITED round is not pinged: the tunnel it opens is the strongest liveness there is, and the
 # server stamps that itself -- ssh -N opens no session, so the forced command behind our key cannot
@@ -35,7 +41,7 @@
 # link every round.
 #
 # Deps, all apt: dnsutils (dig), openssh-client (ssh, ssh-keygen), coreutils (md5sum, timeout),
-# iproute2 (ss). No language runtime, nothing to build, nothing vendored.
+# iproute2 (ss), util-linux (flock). No language runtime, nothing to build, nothing vendored.
 #
 # Usage:
 #   dialout-client dial [--endpoint host:port] [--force] [--idle N]   dial out (the default)
@@ -175,7 +181,13 @@ port_of() {
 
 # Short timeouts: this runs on a link that may be a 4G modem having a bad day, and a run that
 # hangs for minutes on a resolver is worse than one that gives up and tries again in 12 hours.
-dig_q() { dig +short +timeout=5 +tries=2 "$@" 2>/dev/null || true; }
+# ";;" lines are dropped because dig prints its DIAGNOSTICS ON STDOUT even with +short -- a box
+# with no route gets ";; UDP setup with 9.9.9.9#53 ... failed: network unreachable", which has
+# enough words in it to be mistaken for an SRV answer. It was: `check` on a box whose modem was
+# down reported its endpoint as "with:setup", and worse, the invite recheck's "is DNS even alive"
+# confirmation succeeded on it -- so a dead resolver could be read as a withdrawn invite and hang
+# up a working tunnel, which is the one thing that check exists to prevent.
+dig_q() { dig +short +timeout=5 +tries=2 "$@" 2>/dev/null | grep -v '^;' || true; }
 
 invite_name() {
     _n=$(cfg dns-invite)
@@ -223,6 +235,9 @@ endpoint() {
     [ -n "$_r" ] || return 1
     set -- $_r
     [ $# -ge 4 ] || return 1
+    # "priority weight port target", all three numbers: belt to dig_q's braces, so that nothing but
+    # an actual answer can ever come back from here as an endpoint
+    case "$1$2$3" in '' | *[!0-9]*) return 1 ;; esac
     printf '%s %s' "${4%.}" "$3"
 }
 
@@ -251,6 +266,55 @@ busy() {
     have ss || return 1
     ss -tnH state established "( dport = :$(cfg local-port 22) )" 2>/dev/null |
         awk '$3 ~ /^127\./ && $4 ~ /^127\./ { found = 1 } END { exit !found }'
+}
+
+# One dial at a time.
+#
+# Two dials on one box cannot both have the tunnel: the second loses the port race, because the
+# first holds the forwarded port and we dial with ExitOnForwardFailure. The lost race is not the
+# damage -- the loser's CLEANUP is. It runs link_run down and hangs the modem up underneath the
+# winner's live session, so a flapping second dial costs the tunnel, the maintenance session and
+# the rest of the window. Seen on a cart on 2026-10-13: the timer fired into a window the node had
+# already opened, failed to bind the port, and cut an operator out mid-command 55 minutes in.
+#
+# So a second dial refuses before the link hook or anything else runs, and exits 0: "somebody else
+# already has the tunnel" is a fine outcome for a timer round or a cart payload, not a failure for
+# a watch to back off from or a payload to retry.
+#
+# flock holds the lock on a file descriptor, so it is released however this process dies, power cut
+# included -- there is no stale lock to break. Where flock is missing (it is in util-linux, so this
+# is nearly never) mkdir is the fallback: atomic everywhere, with staleness decided by the pid it
+# records.
+lock_file() { printf '%s/dial.lock' "$(state_dir)"; }
+
+dial_lock() {
+    mkdir -p "$(state_dir)" 2>/dev/null || true
+    _lk=$(lock_file)
+    if have flock; then
+        # fd 9 is ours; the ssh child is started with it closed so a lingering carrier cannot keep
+        # the lock after we are gone.
+        exec 9>"$_lk" || die "cannot write the dial lock at $_lk"
+        if flock -n 9; then return 0; fi
+        say_once dial-locked "another dial already holds the tunnel -- leaving it alone"
+        return 1
+    fi
+    _ld="$_lk.d"
+    if ! mkdir "$_ld" 2>/dev/null; then
+        _op=$(cat "$_ld/pid" 2>/dev/null || true)
+        if [ -n "$_op" ] && kill -0 "$_op" 2>/dev/null; then
+            say_once dial-locked "another dial (pid $_op) already holds the tunnel -- leaving it alone"
+            return 1
+        fi
+        log "breaking a stale dial lock from pid ${_op:-?}"
+        rm -rf "$_ld"
+        mkdir "$_ld" 2>/dev/null || {
+            log "cannot take the dial lock at $_ld -- not dialing"
+            return 1
+        }
+    fi
+    printf '%s\n' "$$" >"$_ld/pid" 2>/dev/null || true
+    _lockdir=$_ld
+    return 0
 }
 
 # ------------------------------------------------------------------------------------------------
@@ -322,9 +386,16 @@ dial() {
     _idle=${_idle:-$(cfg idle 1800)}
     _poll=$(cfg poll 30)
     _max=$(cfg hold-max 21600)
+    _redial=$(cfg redial 20)
+    _redial_wait=$(cfg redial-wait 15)
 
     have dig || die "dig not found -- apt install dnsutils"
     have ssh || die "ssh not found -- apt install openssh-client"
+
+    # Before the link hook, before DNS, before anything with a side effect: if another dial has the
+    # tunnel, this round has nothing to do and must not touch what that one is holding.
+    _lockdir=''
+    dial_lock || exit 0
 
     # One cleanup for every way out of here -- normal end, die, signal. It is armed BEFORE the link
     # is raised so that a kill between "up" and the first log line still tears the modem down.
@@ -338,6 +409,10 @@ dial() {
             # || true: this runs from an EXIT trap under set -e, and a modem script that returns
             # non-zero on teardown must not turn a clean run into a failed one
             link_run down || true
+        fi
+        if [ -n "$_lockdir" ]; then
+            rm -rf "$_lockdir"
+            _lockdir=''
         fi
         return 0
     }
@@ -384,99 +459,182 @@ dial() {
 
     log "dial: $_name -> $_host:$_port, reverse port $_rport, idle $_idle s"
 
-    # 3. connect. ExitOnForwardFailure is the important one: if the port is already held (a run
-    #    that has not finished, or a name collision) we want to know, not to sit there connected
-    #    with no tunnel behind us believing all is well.
-    ssh -N -T \
-        -o ExitOnForwardFailure=yes \
-        -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
-        -o StrictHostKeyChecking=accept-new \
-        -o UserKnownHostsFile="$(state_dir)/known_hosts" \
-        -o IdentitiesOnly=yes -i "$_key" \
-        -o ConnectTimeout="$(cfg connect-timeout 20)" \
-        -o BatchMode=yes \
-        -p "$_port" \
-        -R "127.0.0.1:$_rport:127.0.0.1:$(cfg local-port 22)" \
-        "$(cfg ssh-user dialoutd)@$_host" &
-    _pid=$!
-
-    # 4. hold. Three ways this ends: the invite is withdrawn, nothing has used the tunnel for
-    #    `idle`, or hold-max. None of them interrupts a session in progress -- the idle clock only
-    #    advances while the tunnel is quiet, and a withdrawn invite waits for the session to close.
+    # The clocks, kept OUTSIDE the connect loop: a carrier that dies and is redialed is the same
+    # window, and must not win itself a fresh hold-max or a fresh idle period by dying.
     _recheck=$(cfg invite-recheck 60)
     _t0=$(date +%s)
     _last=$_t0
     _seen=0
     _revoked=0
     _recheck_at=$((_t0 + _recheck))
-    while kill -0 "$_pid" 2>/dev/null; do
-        sleep "$_poll"
-        _now=$(date +%s)
+    _tries=0
+    _why=''
+    _hinted=0
+    _rc=0
+    _errf=$(state_dir)/dial.err
 
-        _busy=0
-        if busy; then _busy=1; fi
-        if [ "$_busy" = 1 ]; then
-            if [ "$_seen" = 0 ]; then log "session opened through the tunnel"; fi
-            _seen=1
-            _last=$_now
-        elif [ "$_seen" = 1 ]; then
-            log "session closed"
-            _seen=2
-        fi
+    while :; do
+        # 3. connect. ExitOnForwardFailure is the important one: if the port is already held (a run
+        #    that has not finished, or a name collision) we want to know, not to sit there connected
+        #    with no tunnel behind us believing all is well.
+        #
+        #    The keepalive pair is a budget, not a nicety: it decides how long a stalled link may
+        #    stall before this end gives the carrier up. A mobile link that pauses for a minute --
+        #    a cell reselection, a bad few seconds of radio -- is one plain TCP rides out, so the
+        #    default is deliberately generous (30s x 6 = 3 minutes) and the far end's `sshd-keepalive`
+        #    is matched to it. Tighter than the server's budget and this end does the killing; much
+        #    looser and a dead box's tunnel lingers.
+        _a0=$(date +%s)
+        # ssh's stderr goes to a file for the length of the attempt and is then passed through to
+        # ours. Both failures that matter arrive as exit 255 and only ssh's own words tell them
+        # apart: "remote port forwarding failed" (our port is still held, which is worth asking
+        # about) versus not having reached the server at all (which asking cannot help).
+        : >"$_errf" 2>/dev/null || true
+        ssh -N -T \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval="$(cfg ssh-keepalive 30)" \
+            -o ServerAliveCountMax="$(cfg ssh-keepalive-max 6)" \
+            -o StrictHostKeyChecking=accept-new \
+            -o UserKnownHostsFile="$(state_dir)/known_hosts" \
+            -o IdentitiesOnly=yes -i "$_key" \
+            -o ConnectTimeout="$(cfg connect-timeout 20)" \
+            -o BatchMode=yes \
+            -p "$_port" \
+            -R "127.0.0.1:$_rport:127.0.0.1:$(cfg local-port 22)" \
+            "$(cfg ssh-user dialoutd)@$_host" 9>&- 2>"$_errf" &
+        _pid=$!
 
-        # The invite can be withdrawn while we hold -- Ctrl-C out of `dialout-server wait` is
-        # exactly that -- and a tunnel nobody is waiting on should not sit there for the rest of
-        # `idle`. Rechecked on its own clock, not every poll: it is a DNS query, and the record's
-        # TTL is 60s, so asking faster than that only re-reads the same cached answer.
-        if [ "$_revoked" = 0 ] && [ "$_watch_invite" = 1 ] && [ "$_now" -ge "$_recheck_at" ]; then
-            _recheck_at=$((_now + _recheck))
-            if ! invited "$_tok" >/dev/null 2>&1; then
-                # A withdrawn record and a resolver that has stopped answering look identical from
-                # here -- both are an empty reply. So confirm DNS is alive at all before acting:
-                # dropping a working tunnel because of a hiccup is much the worse failure, and the
-                # idle and hold-max clocks are still there to end the session eventually.
-                if endpoint >/dev/null 2>&1; then
-                    _revoked=1
-                    if [ "$_busy" = 1 ]; then
-                        log "invite withdrawn -- hanging up when this session ends"
+        # 4. hold. Three ways this ends: the invite is withdrawn, nothing has used the tunnel for
+        #    `idle`, or hold-max. None of them interrupts a session in progress -- the idle clock
+        #    only advances while the tunnel is quiet, and a withdrawn invite waits for the session
+        #    to close. A fourth way is not an ending at all: the carrier dying on its own leaves
+        #    `_why` empty and lands in the redial below.
+        while kill -0 "$_pid" 2>/dev/null; do
+            sleep "$_poll"
+            _now=$(date +%s)
+
+            _busy=0
+            if busy; then _busy=1; fi
+            if [ "$_busy" = 1 ]; then
+                if [ "$_seen" = 0 ]; then log "session opened through the tunnel"; fi
+                _seen=1
+                _last=$_now
+            elif [ "$_seen" = 1 ]; then
+                log "session closed"
+                _seen=2
+            fi
+
+            # The invite can be withdrawn while we hold -- Ctrl-C out of `dialout-server wait` is
+            # exactly that -- and a tunnel nobody is waiting on should not sit there for the rest of
+            # `idle`. Rechecked on its own clock, not every poll: it is a DNS query, and the record's
+            # TTL is 60s, so asking faster than that only re-reads the same cached answer.
+            if [ "$_revoked" = 0 ] && [ "$_watch_invite" = 1 ] && [ "$_now" -ge "$_recheck_at" ]; then
+                _recheck_at=$((_now + _recheck))
+                if ! invited "$_tok" >/dev/null 2>&1; then
+                    # A withdrawn record and a resolver that has stopped answering look identical from
+                    # here -- both are an empty reply. So confirm DNS is alive at all before acting:
+                    # dropping a working tunnel because of a hiccup is much the worse failure, and the
+                    # idle and hold-max clocks are still there to end the session eventually.
+                    if endpoint >/dev/null 2>&1; then
+                        _revoked=1
+                        if [ "$_busy" = 1 ]; then
+                            log "invite withdrawn -- hanging up when this session ends"
+                        else
+                            log "invite withdrawn -- hanging up"
+                        fi
                     else
-                        log "invite withdrawn -- hanging up"
+                        log "invite recheck inconclusive (dns not answering) -- holding"
                     fi
-                else
-                    log "invite recheck inconclusive (dns not answering) -- holding"
                 fi
             fi
-        fi
-        if [ "$_revoked" = 1 ] && [ "$_busy" = 0 ]; then break; fi
+            if [ "$_revoked" = 1 ] && [ "$_busy" = 0 ]; then
+                _why=revoked
+                break
+            fi
 
+            if [ $((_now - _last)) -ge "$_idle" ]; then
+                log "idle $_idle s -- hanging up"
+                _why=idle
+                break
+            fi
+            if [ $((_now - _t0)) -ge "$_max" ]; then
+                log "hold-max $_max s reached -- hanging up"
+                _why=hold-max
+                break
+            fi
+        done
+
+        _srv=0
+        if kill -0 "$_pid" 2>/dev/null; then
+            kill "$_pid" 2>/dev/null || true
+            wait "$_pid" 2>/dev/null || true
+        else
+            wait "$_pid" 2>/dev/null || _srv=$?
+            [ "$_srv" = 0 ] || log "ssh exited rc=$_srv"
+        fi
+        _pid=''
+        _held=0
+        if [ -s "$_errf" ]; then
+            if grep -qi 'remote port forwarding failed' "$_errf" 2>/dev/null; then
+                _held=1
+                # Not a broken config, which is how "remote port forwarding failed" reads on its own:
+                # the far end still has our port, from a run that has not idled out or a carrier it
+                # has not finished reaping.
+                if [ "$_hinted" = 0 ]; then
+                    _hinted=1
+                    log "reverse port $_rport is still held on the server"
+                fi
+            fi
+            cat "$_errf" >&2 || true
+        fi
+        if [ -n "$_why" ]; then break; fi
+
+        # 5. the carrier died without being asked to. A link that stalled past the keepalive budget,
+        #    a server restart, a forwarded port not yet released -- none of those is the end of the
+        #    window, and treating them as the end is what makes one bad minute expensive: the next
+        #    timer round is 12h away, and on a cart the node has closed the rail long before then.
+        #    So reconnect, under the same clocks and without touching the link, as long as the window
+        #    still has a reason to exist.
+        _now=$(date +%s)
+        if [ "$_revoked" = 1 ]; then
+            log "carrier lost, and the invite is withdrawn -- not redialing"
+            break
+        fi
         if [ $((_now - _last)) -ge "$_idle" ]; then
-            log "idle $_idle s -- hanging up"
+            log "carrier lost, and nothing has used the tunnel for $((_now - _last))s -- not redialing"
             break
         fi
         if [ $((_now - _t0)) -ge "$_max" ]; then
-            log "hold-max $_max s reached -- hanging up"
+            log "carrier lost at hold-max -- not redialing"
             break
         fi
+        if [ "$_redial" = 0 ]; then
+            log "carrier lost after $((_now - _t0))s (redial=0, so that is the window)"
+            _rc=1
+            break
+        fi
+        # Our port is held and we know it. Ask for it back rather than waiting out the far end's
+        # keepalive budget -- that is minutes, and on a cart the window is not much more than that.
+        if [ "$_held" = 1 ]; then
+            drop_request "$_host" "$_port" "$_rport" || true
+        fi
+        _tries=$((_tries + 1))
+        if [ "$_tries" -gt "$_redial" ]; then
+            log "carrier lost -- gave up after $_redial redials"
+            _rc=1
+            break
+        fi
+        log "carrier lost after $((_now - _t0))s -- redial $_tries of $_redial in ${_redial_wait}s"
+        sleep "$_redial_wait"
     done
 
-    if kill -0 "$_pid" 2>/dev/null; then
-        kill "$_pid" 2>/dev/null || true
-        wait "$_pid" 2>/dev/null || true
-    else
-        wait "$_pid" 2>/dev/null || _rc=$?
-        if [ "${_rc:-0}" != 0 ]; then
-            log "ssh exited rc=${_rc}"
-            # 255 straight away is nearly always ExitOnForwardFailure: the server side of the port
-            # is still held by a run that has not idled out yet. Say so, rather than leaving
-            # "remote port forwarding failed" to be interpreted as a broken config.
-            [ "${_rc}" = 255 ] && [ $(($(date +%s) - _t0)) -lt 15 ] &&
-                log "hint: reverse port $_rport may still be held on the server by an earlier run -- it frees when that one idles out"
-        fi
-    fi
     log "dial: done after $(($(date +%s) - _t0))s"
-    _pid=''
     cleanup
     trap - EXIT INT TERM
+    # Non-zero ONLY when the tunnel could not be restored: a window that ends on its own clocks is a
+    # success, and a window thrown away by a dead carrier must not be reported as "ok" -- a cart
+    # payload retries on that status, and `watch` backs off on it.
+    return "$_rc"
 }
 
 # ------------------------------------------------------------------------------------------------
@@ -651,6 +809,30 @@ ping_maybe() {
         log "ping: FAILED to $_phost:$_pport -- server down, unreachable, or this key is not enrolled"
     fi
     return 0
+}
+
+# Ask the server to let go of our forwarded port.
+#
+# One short session with our own key, carrying the word "drop". The server's forced command turns it
+# into a request its run loop acts on (see dialout-seen), and the name comes from ITS records, so
+# this can only ever drop our own tunnel. Sent when a redial is refused the port: the holder is
+# almost always the carrier we have just lost, which the far end will not notice for as long as its
+# keepalive budget, and that is minutes we do not have to spend.
+drop_request() {
+    _dkey=$(key_file)
+    [ -f "$_dkey" ] || return 1
+    if ssh -n -T \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="$(state_dir)/known_hosts" \
+        -o IdentitiesOnly=yes -i "$_dkey" \
+        -o ConnectTimeout="$(cfg connect-timeout 20)" \
+        -o BatchMode=yes \
+        -p "$2" "$(cfg ssh-user dialoutd)@$1" drop >/dev/null 2>&1; then
+        log "asked the server to release port $3"
+        return 0
+    fi
+    log "could not ask the server to release port $3"
+    return 1
 }
 
 interval_s() {

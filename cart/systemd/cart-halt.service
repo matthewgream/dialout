@@ -3,6 +3,11 @@
 # Deliberately NOT wired to anything else. It is not reached during an ordinary shutdown or reboot
 # (OnFailure fires on failure, not on a stop), so it cannot turn an operator's `reboot` into a
 # poweroff -- which an ExecStopPost on cartdial would have done.
+#
+# It honours the bench inhibit files for the same reason cartdial does: on a bench, `systemctl stop
+# cartdial` is a normal thing to do, it counts as a failure, and landing here would then power the
+# board off under whoever stopped it. Masking this unit instead does not work -- it lives in
+# /etc/systemd/system, where `systemctl mask` will not overwrite it.
 
 [Unit]
 Description=cart halt (cartdial failed or timed out -- release the rail)
@@ -10,4 +15,4 @@ DefaultDependencies=no
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'echo "cart-halt: cartdial did not finish cleanly -- halting" | systemd-cat -t cart-halt; systemctl --no-block poweroff'
+ExecStart=/bin/sh -c 'if [ -e /etc/cart/inhibit ] || [ -e /run/cart-inhibit ]; then echo "cart-halt: inhibited -- NOT halting" | systemd-cat -t cart-halt; exit 0; fi; echo "cart-halt: cartdial did not finish cleanly -- halting" | systemd-cat -t cart-halt; systemctl --no-block poweroff'
